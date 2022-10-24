@@ -17,6 +17,7 @@ import com.wepay.waltz.common.util.Utils;
 import com.wepay.waltz.exception.ClientClosedException;
 import com.wepay.waltz.exception.DataChecksumException;
 import com.wepay.waltz.exception.PartitionInactiveException;
+import com.wepay.waltz.exception.WaitForMountedTimeoutException;
 import com.wepay.zktools.clustermgr.Endpoint;
 import org.slf4j.Logger;
 
@@ -25,9 +26,12 @@ import java.util.LinkedList;
 import java.util.PriorityQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * An internal waltz client representation of a Partition.
@@ -39,6 +43,7 @@ public class Partition {
 
     private static final Long[] EMPTY_LONG_ARRAY = new Long[0];
     private static final int MAX_DATA_ATTEMPTS = 5;
+    private static final int ENSURE_MOUNTED_TIMEOUT = 10000;
 
     private enum PartitionState {
         ACTIVE, INACTIVE, CLOSED
@@ -47,7 +52,8 @@ public class Partition {
     public final int partitionId;
     public final int clientId;
 
-    private final Object lock = new Object();
+    private final ReentrantLock lock = new ReentrantLock();
+    private final Condition partitionStatusChange = lock.newCondition();
     private final Object transactionApplicationLock = new Object();
     private final HashMap<ReqId, TransactionContext> transactionApplicationFailed = new HashMap<>();
     private final TransactionMonitor transactionMonitor;
@@ -99,7 +105,8 @@ public class Partition {
      * Closes the partition, sets the {@link #state} to {@link PartitionState#CLOSED} besides executing other actions.
      */
     public void close() {
-        synchronized (lock) {
+        lock.lock();
+        try {
             this.networkClient = null;
             this.state = PartitionState.CLOSED;
             this.mounted = false;
@@ -115,7 +122,9 @@ public class Partition {
                     }
                 }
             }
-            lock.notifyAll();
+            partitionStatusChange.signalAll();
+        } finally {
+            lock.unlock();
         }
 
         unregisterMetrics();
@@ -127,10 +136,13 @@ public class Partition {
      * @param generation the generation to update to.
      */
     public void generation(int generation) {
-        synchronized (lock) {
+        lock.lock();
+        try {
             if (this.generation < generation) {
                 this.generation = generation;
             }
+        } finally {
+            lock.unlock();
         }
     }
 
@@ -148,11 +160,14 @@ public class Partition {
      * @param highWaterMark the client high-water mark.
      */
     public void activate(long highWaterMark) {
-        synchronized (lock) {
+        lock.lock();
+        try {
             if (transactionMonitor.start()) {
                 clientHighWaterMark.set(highWaterMark);
                 state = PartitionState.ACTIVE;
             }
+        } finally {
+            lock.unlock();
         }
     }
 
@@ -172,10 +187,13 @@ public class Partition {
         // Clean up lockFailureQueue and flushPointQueue
         processAuxilliaryQueues();
 
-        synchronized (lock) {
+        lock.lock();
+        try {
             if (transactionMonitor.isStopped()) {
                 state = PartitionState.INACTIVE;
             }
+        } finally {
+            lock.unlock();
         }
     }
 
@@ -202,12 +220,15 @@ public class Partition {
      * @param networkClient the {@code WaltzNetworkClient} being used to mount the partition.
      */
     public void mounting(WaltzNetworkClient networkClient) {
-        synchronized (lock) {
+        lock.lock();
+        try {
             logger.debug("mounting partition: {}", this);
             this.mounted = false;
             this.clientHighWaterMarkAhead = false;
             this.networkClient = networkClient;
-            lock.notifyAll();
+            partitionStatusChange.signalAll();
+        } finally {
+            lock.unlock();
         }
     }
 
@@ -217,13 +238,16 @@ public class Partition {
      * @param networkClient the {@code WaltzNetworkClient} used to mount the partition.
      */
     public void mounted(WaltzNetworkClient networkClient) {
-        synchronized (lock) {
+        lock.lock();
+        try {
             // Make sure the network client is the right one
             if (this.networkClient == networkClient) {
                 logger.info("partition mounted: {}", this);
                 this.mounted = true;
-                lock.notifyAll();
+                partitionStatusChange.signalAll();
             }
+        } finally {
+            lock.unlock();
         }
 
         flushTransactionsAsyncInternal();
@@ -235,15 +259,18 @@ public class Partition {
      * @param networkClient the {@code WaltzNetworkClient} used to unmount the partition.
      */
     public void unmounted(WaltzNetworkClient networkClient) {
-        synchronized (lock) {
+        lock.lock();
+        try {
             // Make sure the network client is the right one
             if (this.networkClient == networkClient) {
                 logger.debug("partition unmounted: {}", this);
                 this.mounted = false;
                 this.clientHighWaterMarkAhead = false;
                 this.networkClient = null;
-                lock.notifyAll();
+                partitionStatusChange.signalAll();
             }
+        } finally {
+            lock.unlock();
         }
     }
 
@@ -252,11 +279,14 @@ public class Partition {
      * If thread is stuck in ensureMounted, this thread is woken up and throws IllegalStateException
      */
     public void partitionAhead() {
-        synchronized (lock) {
+         lock.lock();
+         try {
             logger.error(String.format("Mounting for partition %d failed, client's high watermark is ahead of server", partitionId));
             this.clientHighWaterMarkAhead = true;
-            lock.notifyAll();
-        }
+            partitionStatusChange.signalAll();
+         } finally {
+             lock.unlock();
+         }
     }
 
     /**
@@ -265,10 +295,12 @@ public class Partition {
      *
      * @throws PartitionInactiveException if this partition is not active.
      * @throws IllegalStateException if client's high watermark is ahead of server's high watermark.
+     * @throws WaitForMountedTimeoutException if client couldn't guarantee that partition is mounted within ENSURE_MOUNTED_TIMEOUT
      */
     public void ensureMounted() {
         if (!mounted) {
-            synchronized (lock) {
+            lock.lock();
+            try {
                 while (state != PartitionState.CLOSED && !mounted) {
                     if (transactionMonitor.isStopped()) {
                         throw new PartitionInactiveException(partitionId);
@@ -277,11 +309,15 @@ public class Partition {
                     }
 
                     try {
-                        lock.wait();
+                        if (!partitionStatusChange.await(ENSURE_MOUNTED_TIMEOUT, TimeUnit.MILLISECONDS)) {
+                            throw new WaitForMountedTimeoutException(partitionId, ENSURE_MOUNTED_TIMEOUT);
+                        }
                     } catch (InterruptedException ex) {
                         Thread.interrupted();
                     }
                 }
+            } finally {
+                lock.unlock();
             }
         }
     }
